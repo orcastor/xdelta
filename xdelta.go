@@ -264,9 +264,9 @@ func resolveInplaceIdenticalBlock(enodeSet map[*equalNode]struct{}, node *equalN
 }
 
 // xdeltaDivideHole divides the Hole in the linked list of holes.
-func xdeltaDivideHole(head **fhT, pos, length uint64) {
-	var prev **fhT
-	tmphead := *head
+func xdeltaDivideHole(head *fhT, pos, length uint64) {
+	var prev *fhT
+	tmphead := head
 
 	for tmphead != nil {
 		if tmphead.Pos <= pos && (tmphead.Pos+tmphead.Len) >= (pos+length) {
@@ -281,7 +281,7 @@ func xdeltaDivideHole(head **fhT, pos, length uint64) {
 
 			if tmphead.Len == 0 {
 				if prev == nil {
-					*head = tmphead.Next
+					head = tmphead.Next
 				} else {
 					(*prev).Next = tmphead.Next
 				}
@@ -293,7 +293,7 @@ func xdeltaDivideHole(head **fhT, pos, length uint64) {
 
 			break
 		}
-		prev = &tmphead
+		prev = tmphead
 		tmphead = tmphead.Next
 	}
 }
@@ -408,9 +408,7 @@ func (p *XdeltaRet) _addBlock(t uint16, tPos uint64, sPos uint64, blkLen uint32,
 	})
 }
 
-func readAndHash(f *os.File, toReadBytes uint64, blkLen int32, tOffset uint64, m hash.Hash) *HasherRet {
-	ret := &HasherRet{}
-
+func readAndHash(f *os.File, ret *HasherRet, toReadBytes uint64, blkLen int32, tOffset uint64, m hash.Hash) {
 	// Allocate buffer
 	buf := make([]byte, XDELTA_BUFFER_LEN)
 
@@ -453,11 +451,9 @@ func readAndHash(f *os.File, toReadBytes uint64, blkLen int32, tOffset uint64, m
 		// Move remaining data to the beginning of the buffer
 		copy(buf, buf[size:])
 	}
-	return ret
 }
 
-func readAndDelta(f *os.File, hashes map[uint32]*SlowHash, holeSet map[uint64]*Hole, blkLen int, needSplitHole bool) *XdeltaRet {
-	ret := &XdeltaRet{blklen: uint32(blkLen)}
+func readAndDelta(f *os.File, ret *XdeltaRet, hashes map[uint32]*SlowHash, holeSet map[uint64]*Hole, blkLen int, needSplitHole bool) {
 	addDiff := !needSplitHole
 	buf := make([]byte, XDELTA_BUFFER_LEN)
 	var holesToRemove []Hole
@@ -473,12 +469,7 @@ func readAndDelta(f *os.File, hashes map[uint32]*SlowHash, holeSet map[uint64]*H
 
 	for _, off := range offsets {
 		h := holeSet[off]
-		offset, err := f.Seek(int64(h.Offset), 0)
-		if err != nil || offset != int64(h.Offset) {
-			errmsg := fmt.Sprintf("Can't seek file %s(%s).", f.Name(), err)
-			panic(errmsg)
-		}
-
+		_, _ = f.Seek(int64(h.Offset), 0)
 		toReadBytes := h.Length
 		rdbuf := 0
 		endbuf := 0
@@ -577,8 +568,6 @@ func readAndDelta(f *os.File, hashes map[uint32]*SlowHash, holeSet map[uint64]*H
 			splitHole(holeSet, h.Offset, h.Length)
 		}
 	}
-
-	return ret
 }
 
 func splitHole(holeSet map[uint64]*Hole, offset, length uint64) {
@@ -732,9 +721,9 @@ func SingleRound(srcfile, tgtfile string) error {
 	head := fhT{Pos: 0, Len: tgtSize}
 
 	// Run hash process on target file
-	var hr *HasherRet
+	hr := &HasherRet{}
 	if tgtSize > 0 {
-		hr = readAndHash(tgtF, head.Len, int32(blklen), head.Pos, nil)
+		readAndHash(tgtF, hr, head.Len, int32(blklen), head.Pos, nil)
 	}
 
 	hashes := make(map[uint32]*SlowHash)
@@ -754,42 +743,142 @@ func SingleRound(srcfile, tgtfile string) error {
 	// Run  process on source file
 	head.Pos = 0
 	head.Len = uint64(ss.Size())
-	var xr *XdeltaRet
+	xr := &XdeltaRet{blklen: uint32(blklen)}
 	if head.Len > 0 {
-		xr = readAndDelta(srcF, hashes, holeSet, int(blklen), false)
+		readAndDelta(srcF, xr, hashes, holeSet, int(blklen), false)
 	}
 
 	// Process the  results
 	for _, l := range xr.l {
 		if l.Type == DT_IDENT {
 			// Handle identification type
-			_, err = tgtF.Seek(int64(getTargetOffset(l)), 0)
-			if err != nil {
-				panic(err)
-			}
-			_, err = tmpTgtF.Seek(int64(l.SOffset), 0)
-			if err != nil {
-				panic(err)
-			}
-
+			_, _ = tgtF.Seek(int64(getTargetOffset(l)), 0)
+			_, _ = tmpTgtF.Seek(int64(l.SOffset), 0)
 			if err := readAndWrite(tgtF, tmpTgtF, l.BlkLen); err != nil {
 				return err
 			}
 		} else {
 			// Handle difference type
-			_, err = srcF.Seek(int64(l.SOffset), 0)
-			if err != nil {
-				panic(err)
-			}
-			_, err = tmpTgtF.Seek(int64(l.SOffset), 0)
-			if err != nil {
-				panic(err)
-			}
-
+			_, _ = srcF.Seek(int64(l.SOffset), 0)
+			_, _ = tmpTgtF.Seek(int64(l.SOffset), 0)
 			if err := readAndWrite(srcF, tmpTgtF, l.BlkLen); err != nil {
 				return err
 			}
 		}
+	}
+
+	tgtF.Close()
+	tmpTgtF.Close()
+	err = os.Rename(tmpTgtF.Name(), tgtF.Name())
+	return err
+}
+
+func MultipleRound(srcfile, tgtfile string) error {
+	srcF, err := os.Open(srcfile)
+	if err != nil {
+		return err
+	}
+	defer srcF.Close()
+	tgtF, err := os.Open(tgtfile)
+	if err != nil {
+		return err
+	}
+	defer tgtF.Close()
+
+	// Create a temporary target file writer
+	tmpTgtF, err := os.CreateTemp(".", "*.xdelta")
+	if err != nil {
+		return err
+	}
+	defer tmpTgtF.Close()
+
+	var blklen uint32
+	ts, err := tgtF.Stat()
+	if err != nil {
+		return err
+	}
+	ss, err := srcF.Stat()
+	if err != nil {
+		return err
+	}
+	tgtSize := uint64(ts.Size())
+	srcSize := uint64(ss.Size())
+	if tgtSize == 0 {
+		blklen = xdeltaCalcBlockLen(srcSize)
+	} else {
+		blklen = xdeltaCalcBlockLen(tgtSize)
+	}
+
+	// Create head structure and initialize result pointers
+	tgtHole := fhT{Pos: 0, Len: tgtSize}
+	srcHole := fhT{Pos: 0, Len: srcSize}
+
+	minimal_blklen := XDELTA_BLOCK_SIZE
+	for {
+		// Run hash process on target file
+		hr := &HasherRet{}
+
+		for h := &tgtHole; h != nil; h = h.Next {
+			if h.Len > 0 {
+				_, _ = tgtF.Seek(int64(h.Pos), 0)
+				readAndHash(tgtF, hr, tgtHole.Len, int32(blklen), tgtHole.Pos, nil)
+			}
+		}
+
+		hashes := make(map[uint32]*SlowHash)
+		for _, h := range hr.l {
+			hashes[h.fastHash] = &SlowHash{
+				Hash: h.SlowHash,
+				TPos: TargetPos{
+					TOffset: h.tOffset,
+					Index:   uint32(h.tIndex),
+				},
+			}
+		}
+
+		holeSet := make(map[uint64]*Hole)
+		holeSet[tgtHole.Pos] = &Hole{Offset: tgtHole.Pos, Length: uint64(ss.Size())}
+
+		// Run Xdelta process on source file
+		xr := &XdeltaRet{blklen: uint32(blklen)}
+		if srcHole.Len > 0 {
+			readAndDelta(srcF, xr, hashes, holeSet, int(blklen), false)
+		}
+
+		// Process the Xdelta results
+		for _, l := range xr.l {
+			if l.Type == DT_IDENT {
+				// Handle identification type
+				_, _ = tgtF.Seek(int64(getTargetOffset(l)), 0)
+				_, _ = tmpTgtF.Seek(int64(l.SOffset), 0)
+				if err := readAndWrite(tgtF, tmpTgtF, l.BlkLen); err != nil {
+					return err
+				}
+			}
+		}
+
+		blklen /= 2 // 减少一半再执行一轮，直到最小块大小。
+		if blklen >= uint32(minimal_blklen) {
+			for _, l := range xr.l {
+				if l.Type == DT_IDENT {
+					xdeltaDivideHole(&tgtHole, getTargetOffset(l), uint64(l.BlkLen))
+					xdeltaDivideHole(&srcHole, l.SOffset, uint64(l.BlkLen))
+				}
+			}
+			continue
+		}
+
+		for _, l := range xr.l {
+			if l.Type == DT_DIFF {
+				// Handle difference type
+				_, _ = srcF.Seek(int64(l.SOffset), 0)
+				_, _ = tmpTgtF.Seek(int64(l.SOffset), 0)
+				if err := readAndWrite(srcF, tmpTgtF, l.BlkLen); err != nil {
+					return err
+				}
+			}
+		}
+		break
 	}
 
 	tgtF.Close()

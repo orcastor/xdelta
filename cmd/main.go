@@ -46,8 +46,8 @@ func main() {
 
 	var err error
 	switch mode {
-	//case "m": // 多轮
-	//	err = multipleRound(srcfile, tgtfile)
+	case "m": // 多轮
+		err = xdelta.MultipleRound(srcfile, tgtfile)
 	case "s": // 单轮
 		err = xdelta.SingleRound(srcfile, tgtfile)
 	//case "i": // 就地生成，隐含单轮
