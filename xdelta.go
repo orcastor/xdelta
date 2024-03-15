@@ -469,7 +469,12 @@ func readAndDelta(f *os.File, ret *XdeltaRet, hashes map[uint32]*SlowHash, holeS
 
 	for _, off := range offsets {
 		h := holeSet[off]
-		_, _ = f.Seek(int64(h.Offset), 0)
+		offset, err := f.Seek(int64(h.Offset), 0)
+		if err != nil || offset != int64(h.Offset) {
+			errmsg := fmt.Sprintf("Can't seek file %s(%s).", f.Name(), err)
+			panic(errmsg)
+		}
+
 		toReadBytes := h.Length
 		rdbuf := 0
 		endbuf := 0
@@ -813,7 +818,6 @@ func MultipleRound(srcfile, tgtfile string) error {
 	tgtHole := fhT{Pos: 0, Len: tgtSize}
 	srcHole := fhT{Pos: 0, Len: srcSize}
 
-	minimal_blklen := XDELTA_BLOCK_SIZE
 	for {
 		// Run hash process on target file
 		hr := &HasherRet{}
@@ -858,7 +862,7 @@ func MultipleRound(srcfile, tgtfile string) error {
 		}
 
 		blklen /= 2 // 减少一半再执行一轮，直到最小块大小。
-		if blklen >= uint32(minimal_blklen) {
+		if blklen >= uint32(XDELTA_BLOCK_SIZE) {
 			for _, l := range xr.l {
 				if l.Type == DT_IDENT {
 					xdeltaDivideHole(&tgtHole, getTargetOffset(l), uint64(l.BlkLen))
