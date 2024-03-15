@@ -50,8 +50,8 @@ func main() {
 		err = xdelta.MultipleRound(srcfile, tgtfile)
 	case "s": // 单轮
 		err = xdelta.SingleRound(srcfile, tgtfile)
-	//case "i": // 就地生成，隐含单轮
-	//	err = singleRoundInplace(srcfile, tgtfile)
+	case "i": // 就地生成，隐含单轮
+		err = xdelta.SingleRoundInplace(srcfile, tgtfile)
 	default:
 		os.Exit(0)
 	}

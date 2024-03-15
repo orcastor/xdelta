@@ -109,7 +109,6 @@ type xitT struct {
 	TOffset uint64
 	Index   uint32
 	BlkLen  uint32
-	Next    *xitT
 }
 
 // TargetPos represents the target_pos struct in C.
@@ -299,8 +298,8 @@ func xdeltaDivideHole(head *fhT, pos, length uint64) {
 }
 
 // xdeltaResolveInplace resolves xdelta inplace.
-func xdeltaResolveInplace(head **xitT) {
-	if *head == nil {
+func xdeltaResolveInplace(list *[]*xitT) {
+	if len(*list) <= 0 {
 		return
 	}
 
@@ -308,38 +307,26 @@ func xdeltaResolveInplace(head **xitT) {
 	var identBlocks []*equalNode
 	var resultIdentBlocks []*equalNode
 
-	diffHead := (*xitT)(nil)
-	var diffPrev *xitT
+	var retList []*xitT
 
-	for node := *head; node != nil; node = node.Next {
-		if node.Type == DT_IDENT { // DT_IDENT
+	for _, l := range *list {
+		if l.Type == DT_IDENT { // DT_IDENT
 			p := &equalNode{
-				BLength: node.BlkLen,
-				SOffset: node.SOffset,
+				BLength: l.BlkLen,
+				SOffset: l.SOffset,
 				Visited: false,
 				Stacked: false,
 				Deleted: false,
 				TPos: TargetPos{
-					TOffset: node.TOffset,
-					Index:   node.Index,
+					TOffset: l.TOffset,
+					Index:   l.Index,
 				},
-				Data: node,
+				Data: l,
 			}
 			identBlocks = append(identBlocks, p)
 		} else {
-			if diffHead == nil {
-				diffHead = node
-			}
-
-			if diffPrev != nil {
-				diffPrev.Next = node
-			}
-			diffPrev = node
+			retList = append(retList, l)
 		}
-	}
-
-	if diffPrev != nil {
-		diffPrev.Next = nil
 	}
 
 	for _, pos := range identBlocks {
@@ -349,20 +336,15 @@ func xdeltaResolveInplace(head **xitT) {
 
 	for _, pos := range identBlocks {
 		if pos.Deleted == true {
-			p := (pos.Data).(*xitT)
-			p.Type = DT_DIFF
-			p.Next = diffHead
-			diffHead = p
+			retList = append(retList, (pos.Data).(*xitT))
 		}
 	}
 
 	for i := len(resultIdentBlocks) - 1; i >= 0; i-- {
-		p := (resultIdentBlocks[i].Data).(*xitT)
-		p.Next = diffHead
-		diffHead = p
+		retList = append(retList, (resultIdentBlocks[i].Data).(*xitT))
 	}
 
-	*head = diffHead
+	list = &retList
 }
 
 type HasherRet struct {
@@ -883,6 +865,105 @@ func MultipleRound(srcfile, tgtfile string) error {
 			}
 		}
 		break
+	}
+
+	tgtF.Close()
+	tmpTgtF.Close()
+	err = os.Rename(tmpTgtF.Name(), tgtF.Name())
+	return err
+}
+
+func SingleRoundInplace(srcfile, tgtfile string) error {
+	srcF, err := os.Open(srcfile)
+	if err != nil {
+		return err
+	}
+	defer srcF.Close()
+	tgtF, err := os.Open(tgtfile)
+	if err != nil {
+		return err
+	}
+	defer tgtF.Close()
+
+	// Create a temporary target file writer
+	tmpTgtF, err := os.CreateTemp(".", "*.xdelta")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer tmpTgtF.Close()
+
+	var blklen uint32
+	ts, err := tgtF.Stat()
+	if err != nil {
+		return err
+	}
+	ss, err := srcF.Stat()
+	if err != nil {
+		return err
+	}
+
+	// 如果目标文件大小为0时，用源文件的大小计算出来的块大小来分析文件，因为这样
+	// 可以尽量减少计算的量。在计算 Xdelta 时，0 的块大小，可能导致最小的块计算大小，如400B，
+	// 如果此时，源文件很大，如几百M，则可能导致内部会有很多循环，并且每个循环只输出 400B，
+	// 如果此时输出更大的块，则计算量会小很多，如最大的块为 1M，则 1024*1024/400，差距达
+	// 2000 多倍。
+	tgtSize := uint64(ts.Size())
+	if tgtSize == 0 {
+		blklen = xdeltaCalcBlockLen(uint64(ss.Size()))
+	} else {
+		blklen = xdeltaCalcBlockLen(tgtSize)
+	}
+
+	// Create head structure and initialize result pointers
+	head := fhT{Pos: 0, Len: tgtSize}
+
+	// Run hash process on target file
+	hr := &HasherRet{}
+	if tgtSize > 0 {
+		readAndHash(tgtF, hr, head.Len, int32(blklen), head.Pos, nil)
+	}
+
+	hashes := make(map[uint32]*SlowHash)
+	for _, h := range hr.l {
+		hashes[h.fastHash] = &SlowHash{
+			Hash: h.SlowHash,
+			TPos: TargetPos{
+				TOffset: h.tOffset,
+				Index:   uint32(h.tIndex),
+			},
+		}
+	}
+
+	holeSet := make(map[uint64]*Hole)
+	holeSet[head.Pos] = &Hole{Offset: head.Pos, Length: uint64(ss.Size())}
+
+	// Run  process on source file
+	head.Pos = 0
+	head.Len = uint64(ss.Size())
+	xr := &XdeltaRet{blklen: uint32(blklen)}
+	if head.Len > 0 {
+		readAndDelta(srcF, xr, hashes, holeSet, int(blklen), false)
+	}
+
+	xdeltaResolveInplace(&xr.l)
+
+	// Process the  results
+	for _, l := range xr.l {
+		if l.Type == DT_IDENT {
+			// Handle identification type
+			_, _ = tgtF.Seek(int64(getTargetOffset(l)), 0)
+			_, _ = tmpTgtF.Seek(int64(l.SOffset), 0)
+			if err := readAndWrite(tgtF, tmpTgtF, l.BlkLen); err != nil {
+				return err
+			}
+		} else {
+			// Handle difference type
+			_, _ = srcF.Seek(int64(l.SOffset), 0)
+			_, _ = tmpTgtF.Seek(int64(l.SOffset), 0)
+			if err := readAndWrite(srcF, tmpTgtF, l.BlkLen); err != nil {
+				return err
+			}
+		}
 	}
 
 	tgtF.Close()
