@@ -386,7 +386,6 @@ func (p *XdeltaRet) _addBlock(t uint16, tPos uint64, sPos uint64, blkLen uint32,
 		TOffset: tPos,
 		Index:   tIndex,
 		BlkLen:  blkLen,
-		Next:    nil,
 	})
 }
 
@@ -886,7 +885,7 @@ func SingleRoundInplace(srcfile, tgtfile string) error {
 	defer tgtF.Close()
 
 	// Create a temporary target file writer
-	tmpTgtF, err := os.CreateTemp(".", "*.xdelta")
+	tmpTgtF, err := os.OpenFile(tgtfile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -965,9 +964,5 @@ func SingleRoundInplace(srcfile, tgtfile string) error {
 			}
 		}
 	}
-
-	tgtF.Close()
-	tmpTgtF.Close()
-	err = os.Rename(tmpTgtF.Name(), tgtF.Name())
 	return err
 }
