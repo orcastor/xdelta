@@ -3,9 +3,11 @@ package xdelta
 import (
 	"fmt"
 	"hash"
+	"io"
 	"log"
 	"math"
 	"os"
+	"sort"
 
 	"golang.org/x/crypto/md4"
 )
@@ -87,15 +89,6 @@ type Rollsum struct {
 	count uint64
 	s1    uint64
 	s2    uint64
-}
-
-type xdeltaResult interface {
-	addBlock(buf []byte, blkLen uint32, sOffset uint64)
-	addBlock2(tpos TargetPos, blkLen uint32, sOffset uint64)
-}
-
-type hasherResult interface {
-	addBlock(fhash uint32, shash *SlowHash)
 }
 
 func (sum *Rollsum) Rotate(out, in byte) {
@@ -329,18 +322,61 @@ func xdeltaResolveInplace(head **xitT) {
 	*head = diffHead
 }
 
-func readAndHash(f *os.File, ret hasherResult, toReadBytes uint64, blkLen int32, tOffset uint64, m hash.Hash) {
-	const xDeltaBufferLen = 1024 // Assuming XDELTA_BUFFER_LEN is defined as 1024 in C
+type HasherRet struct {
+	l []*hitT
+}
+
+func (p *HasherRet) addBlock(fhash uint32, shash *SlowHash) {
+	p.l = append(p.l, &hitT{
+		fastHash: fhash,
+		SlowHash: shash.Hash,
+		tOffset:  shash.TPos.TOffset,
+		tIndex:   uint(shash.TPos.Index),
+		next:     nil,
+	})
+}
+
+type XdeltaRet struct {
+	l      []*xitT
+	blklen uint32
+}
+
+func (p *XdeltaRet) addBlock2(tpos TargetPos, blkLen uint32, sOffset uint64) {
+	if blkLen != p.blklen {
+		fmt.Println("Block length not match!")
+		return
+	}
+
+	p._addBlock(DT_IDENT, tpos.TOffset, sOffset, blkLen, tpos.Index)
+}
+
+func (p *XdeltaRet) addBlock(data []byte, blkLen uint32, sOffset uint64) {
+	p._addBlock(DT_DIFF, 0, sOffset, blkLen, math.MaxUint32)
+}
+
+func (p *XdeltaRet) _addBlock(t uint16, tPos uint64, sPos uint64, blkLen uint32, tIndex uint32) {
+	p.l = append(p.l, &xitT{
+		Type:    t,
+		SOffset: sPos,
+		TOffset: tPos,
+		Index:   tIndex,
+		BlkLen:  blkLen,
+		Next:    nil,
+	})
+}
+
+func readAndHash(f *os.File, toReadBytes uint64, blkLen int32, tOffset uint64, m hash.Hash) *HasherRet {
+	ret := &HasherRet{}
 
 	// Allocate buffer
-	buf := make([]byte, xDeltaBufferLen)
+	buf := make([]byte, XDELTA_BUFFER_LEN)
 
 	index := uint32(0)
 
 	for toReadBytes > 0 {
 		// Read data from the file
-		size, err := f.Read(buf[:toReadBytes])
-		if err != nil || size <= 0 {
+		size, err := f.Read(buf)
+		if err != nil && err != io.EOF {
 			errmsg := "Can't not read file or pipe."
 			panic(errmsg)
 		}
@@ -360,27 +396,40 @@ func readAndHash(f *os.File, ret hasherResult, toReadBytes uint64, blkLen int32,
 			}
 
 			fhash := RollsumHash(buf[i:end], int(blkLen))
-			ret.addBlock(fhash, &SlowHash{
+			sh := &SlowHash{
 				TPos: TargetPos{
 					Index:   index,
 					TOffset: tOffset,
 				},
-				Hash: md4.New().Sum(buf[i:end]),
-			})
+			}
+			copy(sh.Hash[:], md4.New().Sum(buf[i:end]))
+			ret.addBlock(fhash, sh)
 			index++
 		}
 
 		// Move remaining data to the beginning of the buffer
 		copy(buf, buf[size:])
 	}
+	return ret
 }
 
-func readAndDelta(f *os.File, ret xdeltaResult, hashes map[uint32]*SlowHash, holeSet map[uint64]*Hole, blkLen int, needSplitHole bool) {
-	adddiff := !needSplitHole
+func readAndDelta(f *os.File, hashes map[uint32]*SlowHash, holeSet map[uint64]*Hole, blkLen int, needSplitHole bool) *XdeltaRet {
+	ret := &XdeltaRet{blklen: uint32(blkLen)}
+	addDiff := !needSplitHole
 	buf := make([]byte, XDELTA_BUFFER_LEN)
 	var holesToRemove []Hole
 
-	for _, h := range holeSet {
+	var offsets []uint64
+	for off, _ := range holeSet {
+		offsets = append(offsets, off)
+	}
+
+	sort.Slice(offsets, func(i, j int) bool {
+		return offsets[i] < offsets[j]
+	})
+
+	for _, off := range offsets {
+		h := holeSet[off]
 		offset, err := f.Seek(int64(h.Offset), 0)
 		if err != nil || offset != int64(h.Offset) {
 			errmsg := fmt.Sprintf("Can't seek file %s(%s).", f.Name(), err)
@@ -401,14 +450,14 @@ func readAndDelta(f *os.File, ret xdeltaResult, hashes map[uint32]*SlowHash, hol
 			if remain < blkLen {
 				if toReadBytes == 0 {
 					slipSize := endbuf - sentrybuf
-					if slipSize > 0 && adddiff {
+					if slipSize > 0 && addDiff {
 						ret.addBlock(buf[sentrybuf:endbuf], uint32(slipSize), uint64(offset))
 					}
 					break
 				} else {
 					slipSize := rdbuf - sentrybuf
 					if slipSize > 0 {
-						if adddiff {
+						if addDiff {
 							ret.addBlock(buf[sentrybuf:rdbuf], uint32(slipSize), uint64(offset))
 						}
 						offset += int64(slipSize)
@@ -427,10 +476,14 @@ func readAndDelta(f *os.File, ret xdeltaResult, hashes map[uint32]*SlowHash, hol
 					endbuf = remain
 
 					for buflen > 0 {
-						size, err := f.Read(buf[remain:])
-						if err != nil || size <= 0 {
-							errmsg := fmt.Sprintf("Can't not read file or pipe: %s", err)
-							panic(errmsg)
+						size, err := f.Read(buf)
+						if err != nil {
+							if err != io.EOF {
+								errmsg := fmt.Sprintf("Can't not read file: %s", err)
+								panic(errmsg)
+							} else {
+								break
+							}
 						}
 						toReadBytes -= uint64(size)
 						buflen -= size
@@ -451,7 +504,7 @@ func readAndDelta(f *os.File, ret xdeltaResult, hashes map[uint32]*SlowHash, hol
 			if bsh, ok := hashes[uint32(hasher.Digest())]; ok {
 				slipSize := rdbuf - sentrybuf
 				if slipSize > 0 {
-					if adddiff {
+					if addDiff {
 						ret.addBlock(buf[sentrybuf:rdbuf], uint32(slipSize), uint64(offset))
 					}
 					offset += int64(slipSize)
@@ -481,6 +534,8 @@ func readAndDelta(f *os.File, ret xdeltaResult, hashes map[uint32]*SlowHash, hol
 			splitHole(holeSet, h.Offset, h.Length)
 		}
 	}
+
+	return ret
 }
 
 func splitHole(holeSet map[uint64]*Hole, offset, length uint64) {
@@ -505,8 +560,6 @@ func splitHole(holeSet map[uint64]*Hole, offset, length uint64) {
 			holeSet[offset+length].Length = bigEnd - holeEnd
 		}
 	}
-
-	return
 }
 
 func rsyncSumSizesSqroot(len uint64) uint32 {
@@ -566,50 +619,6 @@ func xdeltaSumBlockSize(filesize uint64) uint32 {
 	return iBlkSize
 }
 
-type HasherRet struct {
-	l      []*hitT
-	blklen uint32
-}
-
-func (p *HasherRet) addBlock(fhash uint32, shash *SlowHash) {
-	p.l = append(p.l, &hitT{
-		fastHash: fhash,
-		SlowHash: shash.Hash,
-		tOffset:  shash.TPos.TOffset,
-		tIndex:   uint(shash.TPos.Index),
-		next:     nil,
-	})
-}
-
-type XdeltaRet struct {
-	l      []*xitT
-	blklen uint32
-}
-
-func (p *XdeltaRet) addBlock2(tpos TargetPos, blkLen uint32, sOffset uint64) {
-	if blkLen != p.blklen {
-		fmt.Println("Block length not match!")
-		return
-	}
-
-	p._addBlock(DT_IDENT, tpos.TOffset, sOffset, blkLen, tpos.Index)
-}
-
-func (p *XdeltaRet) addBlock(data []byte, blkLen uint32, sOffset uint64) {
-	p._addBlock(DT_DIFF, 0, sOffset, blkLen, math.MaxUint32)
-}
-
-func (p *XdeltaRet) _addBlock(t uint16, tPos uint64, sPos uint64, blkLen uint32, tIndex uint32) {
-	p.l = append(p.l, &xitT{
-		Type:    t,
-		SOffset: sPos,
-		TOffset: tPos,
-		Index:   tIndex,
-		BlkLen:  blkLen,
-		Next:    nil,
-	})
-}
-
 func readAndWrite(r *os.File, w *os.File, blklen uint32) error {
 	const BUFSIZE = 4096
 	databuf := make([]byte, BUFSIZE)
@@ -641,19 +650,34 @@ func readAndWrite(r *os.File, w *os.File, blklen uint32) error {
 	return nil
 }
 
-func singleRound(srcfile, tgtfile string) {
+func SingleRound(srcfile, tgtfile string) error {
 	srcF, err := os.Open(srcfile)
+	if err != nil {
+		return err
+	}
+	defer srcF.Close()
 	tgtF, err := os.Open(tgtfile)
+	if err != nil {
+		return err
+	}
+	defer tgtF.Close()
 
 	// Create a temporary target file writer
-	tmpTgtF, err := os.CreateTemp("", "*.tmp")
+	tmpTgtF, err := os.CreateTemp(".", "*.xdelta")
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer tmpTgtF.Close()
 
 	var blklen uint32
 	ts, err := tgtF.Stat()
+	if err != nil {
+		return err
+	}
 	ss, err := srcF.Stat()
+	if err != nil {
+		return err
+	}
 	tgtSize := uint64(ts.Size())
 	if tgtSize == 0 {
 		blklen = xdeltaCalcBlockLen(uint64(ss.Size()))
@@ -665,9 +689,9 @@ func singleRound(srcfile, tgtfile string) {
 	head := fhT{Pos: 0, Len: tgtSize}
 
 	// Run hash process on target file
-	hr := &HasherRet{}
+	var hr *HasherRet
 	if tgtSize > 0 {
-		readAndHash(tgtF, hr, head.Len, int32(blklen), head.Pos, nil)
+		hr = readAndHash(tgtF, head.Len, int32(blklen), head.Pos, nil)
 	}
 
 	hashes := make(map[uint32]*SlowHash)
@@ -682,14 +706,14 @@ func singleRound(srcfile, tgtfile string) {
 	}
 
 	holeSet := make(map[uint64]*Hole)
-	holeSet[head.Pos] = &Hole{Offset: head.Pos, Length: head.Len}
+	holeSet[head.Pos] = &Hole{Offset: head.Pos, Length: uint64(ss.Size())}
 
 	// Run  process on source file
 	head.Pos = 0
 	head.Len = uint64(ss.Size())
-	xr := &XdeltaRet{}
+	var xr *XdeltaRet
 	if head.Len > 0 {
-		readAndDelta(srcF, xr, hashes, holeSet, int(blklen), false)
+		xr = readAndDelta(srcF, hashes, holeSet, int(blklen), false)
 	}
 
 	// Process the  results
@@ -706,7 +730,7 @@ func singleRound(srcfile, tgtfile string) {
 			}
 
 			if err := readAndWrite(tgtF, tmpTgtF, l.BlkLen); err != nil {
-				return
+				return err
 			}
 		} else {
 			// Handle difference type
@@ -720,13 +744,13 @@ func singleRound(srcfile, tgtfile string) {
 			}
 
 			if err := readAndWrite(srcF, tmpTgtF, l.BlkLen); err != nil {
-				return
+				return err
 			}
 		}
 	}
 
-	err = os.Rename(tmpTgtF.Name(), tgtfile)
-	if err != nil {
-		panic(err)
-	}
+	tgtF.Close()
+	tmpTgtF.Close()
+	err = os.Rename(tmpTgtF.Name(), tgtF.Name())
+	return err
 }
