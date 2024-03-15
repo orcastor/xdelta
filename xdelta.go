@@ -14,12 +14,55 @@ import (
 
 // Constants
 const (
-	DIGEST_BYTES           = 16
+	DIGEST_BYTES = 16
+	/// 在一些内存受限系统中，如果下面的参数定义得很多，有可能导致内存耗用过多，使系统
+	/// 运行受到影响，甚至是宕机，所以，当你需要你的目标系统的内存特性后，请你自己定义相应的
+	/// 的大小。不过建议 MULTIROUND_MAX_BLOCK_SIZE 不要小于 512 KB，XDELTA_BUFFER_LEN 必须大于
+	/// MULTIROUND_MAX_BLOCK_SIZE，最好为 2 的 N 次方倍，如 8 倍 等。
+	/// 当你的系统中存在大量内存时，较大的内存可以优化实现。使用库同步数据时，软件系统最多占用内存
+	/// 的大概为：
+	///		在数据源端（客户端）：
+	///			线程数 * XDELTA_BUFFER_LEN * 3，如果系统内存受限，你可以采用少线程的方式进行处理方式，
+	///			但是你无法使用多线程的优势。
+	///		在数据目标端（服务端）：
+	///			线程数 * XDELTA_BUFFER_LEN * 2，但是线程数量受到并发的客户端的数目以及每客户端在同步数据时
+	///			采用的线程数。
+	/// 由于在同步时，如果文件大小或者块大小，没有达到 XDELTA_BUFFER_LEN 长度，则未被使用的地址系统不会分配
+	/// 物理内存，因此有时只会占用进程的地址空间，但却不会占用系统的物理内存。
 	XDELTA_BUFFER_LEN      = (1 << 23)
 	ROLLSUM_CHAR_OFFSET    = 31
 	XDELTA_BLOCK_SIZE      = 16   // Define your XDELTA_BLOCK_SIZE here
 	MAX_XDELTA_BLOCK_BYTES = 4096 // Define your MAX_XDELTA_BLOCK_BYTES here
 )
+
+/**
+ *   在使用本库前，请阅读本说明及各接口详细说明：
+ *
+ *	1. 角色定义：如果有文件 A 与 B，需要将 A 差异同步到 B，或者要计算 A 与 B 的差异数据，我们这里
+ *		称 B 为目标文件，A 为源文件。
+ *
+ *  2. 在多轮同步或者差异计算中，会计算得出目标文件与源文件有多个相同的块，则这些相同的块会导致文件形成不同的“洞”，
+ *		再依次对这些“洞”进行差异计算，如下示：
+ *		a、开始时 A 文件与 B 文件计算，整个文件可以默认为一个从0到文件大小的洞，如有一块相同的块计算出为：
+ *			源文件A：  |                           |SSSSSSSSSSSSSSS|                                               |
+ *							                       ^
+ *							           |-----------|
+ *			目标文件B：|     |SSSSSSSSSSSSSSS|                                                                        |
+ *		b、如计算结果如 a 中所示 S 块相同，则会形成如下的洞：
+ *			源文件A：|           洞1             |SSSSSSSSSSSSSSS|          洞2                                  |
+ *							                       ^
+ *							           |-----------|
+ *			目标文件B：| 洞3 |SSSSSSSSSSSSSSS|                                    洞4                                 |
+ *		c、这里需要将“洞3”与“同4”再用更小的块计算哈希，并供传输给文件 A，同时对“洞1”与“洞2”进行差异计算，并将计算结果回传。
+ *		d、不断计算，会形成更多更小的洞，直到最小的块达到，则停止计算。
+ *		e、每一轮计算时，就可将计算结果回传，除了最后一轮会传递差异数据外，其他的轮都是传输的相同的数据块记录信息。
+ *
+ *  3. 对于就地生成文件，可能会导致同步结果的退化。想了解详细的信息，可以参考：
+ *		In-Place Rsync: File Synchronization for Mobile and Wireless Devices，
+ *				David Rasch and Randal Burns Department of Computer Science Johns Hopkins University {frasch,randalg}@cs.jhu.edu。
+ *
+ *	4. 多线程支持。接口中的所有接口都是线程安全的，你可以自己通过多线程的方法利用多核能力。
+ */
 
 const (
 	DT_DIFF  uint16 = 0x0
