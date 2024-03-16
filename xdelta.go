@@ -12,24 +12,24 @@ import (
 	"golang.org/x/crypto/md4"
 )
 
+// / 在一些内存受限系统中，如果下面的参数定义得很多，有可能导致内存耗用过多，使系统
+// / 运行受到影响，甚至是宕机，所以，当你需要你的目标系统的内存特性后，请你自己定义相应的
+// / 的大小。不过建议 MULTIROUND_MAX_BLOCK_SIZE 不要小于 512 KB，XDELTA_BUFFER_LEN 必须大于
+// / MULTIROUND_MAX_BLOCK_SIZE，最好为 2 的 N 次方倍，如 8 倍 等。
+// / 当你的系统中存在大量内存时，较大的内存可以优化实现。使用库同步数据时，软件系统最多占用内存
+// / 的大概为：
+// /		在数据源端（客户端）：
+// /			线程数 * XDELTA_BUFFER_LEN * 3，如果系统内存受限，你可以采用少线程的方式进行处理方式，
+// /			但是你无法使用多线程的优势。
+// /		在数据目标端（服务端）：
+// /			线程数 * XDELTA_BUFFER_LEN * 2，但是线程数量受到并发的客户端的数目以及每客户端在同步数据时
+// /			采用的线程数。
+// / 由于在同步时，如果文件大小或者块大小，没有达到 XDELTA_BUFFER_LEN 长度，则未被使用的地址系统不会分配
+// / 物理内存，因此有时只会占用进程的地址空间，但却不会占用系统的物理内存。
 // Constants
 const (
-	DIGEST_BYTES = 16
-	/// 在一些内存受限系统中，如果下面的参数定义得很多，有可能导致内存耗用过多，使系统
-	/// 运行受到影响，甚至是宕机，所以，当你需要你的目标系统的内存特性后，请你自己定义相应的
-	/// 的大小。不过建议 MULTIROUND_MAX_BLOCK_SIZE 不要小于 512 KB，XDELTA_BUFFER_LEN 必须大于
-	/// MULTIROUND_MAX_BLOCK_SIZE，最好为 2 的 N 次方倍，如 8 倍 等。
-	/// 当你的系统中存在大量内存时，较大的内存可以优化实现。使用库同步数据时，软件系统最多占用内存
-	/// 的大概为：
-	///		在数据源端（客户端）：
-	///			线程数 * XDELTA_BUFFER_LEN * 3，如果系统内存受限，你可以采用少线程的方式进行处理方式，
-	///			但是你无法使用多线程的优势。
-	///		在数据目标端（服务端）：
-	///			线程数 * XDELTA_BUFFER_LEN * 2，但是线程数量受到并发的客户端的数目以及每客户端在同步数据时
-	///			采用的线程数。
-	/// 由于在同步时，如果文件大小或者块大小，没有达到 XDELTA_BUFFER_LEN 长度，则未被使用的地址系统不会分配
-	/// 物理内存，因此有时只会占用进程的地址空间，但却不会占用系统的物理内存。
-	XDELTA_BUFFER_LEN      = (1 << 23)
+	DIGEST_BYTES           = 16
+	XDELTA_BUFFER_LEN      = (1 << 22)
 	ROLLSUM_CHAR_OFFSET    = 31
 	XDELTA_BLOCK_SIZE      = 16   // Define your XDELTA_BLOCK_SIZE here
 	MAX_XDELTA_BLOCK_BYTES = 4096 // Define your MAX_XDELTA_BLOCK_BYTES here
@@ -71,11 +71,10 @@ const (
 
 // hitT represents a hash item.
 type hitT struct {
-	fastHash uint32
+	FastHash uint32
 	SlowHash [DIGEST_BYTES]byte
-	tOffset  uint64
-	tIndex   uint
-	next     *hitT
+	Offset   uint64
+	Index    uint
 }
 
 // equalNode represents a node with equal data.
@@ -87,12 +86,6 @@ type equalNode struct {
 	Visited bool
 	Stacked bool
 	Deleted bool
-}
-
-// diffNode represents a node with different data.
-type diffNode struct {
-	SOffset uint64
-	BLength uint32
 }
 
 // fhT represents the fhT struct in C.
@@ -133,30 +126,30 @@ type Rollsum struct {
 	s2    uint64
 }
 
-func (sum *Rollsum) Rotate(out, in byte) {
-	sum.s1 += uint64(in) - uint64(out)
-	sum.s2 += sum.s1 - sum.count*(uint64(out)+uint64(ROLLSUM_CHAR_OFFSET))
+func (rs *Rollsum) Rotate(out, in byte) {
+	rs.s1 += uint64(in) - uint64(out)
+	rs.s2 += rs.s1 - rs.count*(uint64(out)+uint64(ROLLSUM_CHAR_OFFSET))
 }
 
-func (sum *Rollsum) Rollin(c byte) {
-	sum.s1 += uint64(c) + uint64(ROLLSUM_CHAR_OFFSET)
-	sum.s2 += sum.s1
-	sum.count++
+func (rs *Rollsum) Rollin(c byte) {
+	rs.s1 += uint64(c) + uint64(ROLLSUM_CHAR_OFFSET)
+	rs.s2 += rs.s1
+	rs.count++
 }
 
-func (sum *Rollsum) Rollout(c byte) {
-	sum.s1 -= uint64(c) + uint64(ROLLSUM_CHAR_OFFSET)
-	sum.s2 -= sum.count * (uint64(c) + uint64(ROLLSUM_CHAR_OFFSET))
-	sum.count--
+func (rs *Rollsum) Rollout(c byte) {
+	rs.s1 -= uint64(c) + uint64(ROLLSUM_CHAR_OFFSET)
+	rs.s2 -= rs.count * (uint64(c) + uint64(ROLLSUM_CHAR_OFFSET))
+	rs.count--
 }
 
-func (sum *Rollsum) Digest() uint32 {
-	return uint32((sum.s2 << 16) | (sum.s1 & 0xffff))
+func (rs *Rollsum) Digest() uint32 {
+	return uint32((rs.s2 << 16) | (rs.s1 & 0xffff))
 }
 
-func (sum *Rollsum) EatHash(buf []byte, len int) {
+func (rs *Rollsum) EatHash(buf []byte, len int) {
 	for i := 0; i < len; i++ {
-		sum.Rollin(buf[i])
+		rs.Rollin(buf[i])
 	}
 }
 
@@ -166,11 +159,11 @@ func RollsumHash(buf []byte, len int) uint32 {
 	return rs.Digest()
 }
 
-func (sum *Rollsum) Hash(buf []byte, len int) {
-	s1 := sum.s1
-	s2 := sum.s2
+func (rs *Rollsum) Hash(buf []byte, len int) {
+	s1 := rs.s1
+	s2 := rs.s2
 
-	sum.count += uint64(len)
+	rs.count += uint64(len)
 	for len >= 16 {
 		s1 += uint64(buf[0]) + uint64(buf[1]) + uint64(buf[2]) + uint64(buf[3]) +
 			uint64(buf[4]) + uint64(buf[5]) + uint64(buf[6]) + uint64(buf[7]) +
@@ -189,13 +182,13 @@ func (sum *Rollsum) Hash(buf []byte, len int) {
 		len--
 	}
 
-	sum.s1 = s1
-	sum.s2 = s2
+	rs.s1 = s1
+	rs.s2 = s2
 }
 
-func (sum *Rollsum) Update(out, in byte) uint32 {
-	sum.Rotate(out, in)
-	return sum.Digest()
+func (rs *Rollsum) Update(out, in byte) uint32 {
+	rs.Rotate(out, in)
+	return rs.Digest()
 }
 
 // getTargetOffset returns the target offset.
@@ -204,14 +197,8 @@ func getTargetOffset(head *xitT) uint64 {
 }
 
 // resolveInplaceIdenticalBlock resolves identical blocks inplace.
-func resolveInplaceIdenticalBlock(enodeSet map[*equalNode]struct{}, node *equalNode, identBlocks []*equalNode, diffBlocks []*diffNode) {
+func resolveInplaceIdenticalBlock(enodeSet map[*equalNode]struct{}, node *equalNode, identBlocks []*equalNode) {
 	if node.Stacked { // cyclic condition, convert it to adding bytes to target.
-		if diffBlocks != nil {
-			diffBlocks = append(diffBlocks, &diffNode{
-				BLength: node.BLength,
-				SOffset: node.SOffset,
-			})
-		}
 		node.Deleted = true
 		return
 	}
@@ -241,13 +228,13 @@ func resolveInplaceIdenticalBlock(enodeSet map[*equalNode]struct{}, node *equalN
 	// to check if this equal node is overlap with one and/or its
 	// directly following block on target. Handle the left side first.
 	if _, found := enodeSet[forgeNode]; found && forgeNode != node {
-		resolveInplaceIdenticalBlock(enodeSet, forgeNode, identBlocks, diffBlocks)
+		resolveInplaceIdenticalBlock(enodeSet, forgeNode, identBlocks)
 	}
 
 	// Then handle the right side.
 	enode.TPos.Index = uint32(rightIndex)
 	if _, found := enodeSet[&enode]; found && &enode != node {
-		resolveInplaceIdenticalBlock(enodeSet, &enode, identBlocks, diffBlocks)
+		resolveInplaceIdenticalBlock(enodeSet, &enode, identBlocks)
 	}
 
 	// This node's all dependencies have been resolved.
@@ -331,11 +318,11 @@ func xdeltaResolveInplace(list *[]*xitT) {
 
 	for _, pos := range identBlocks {
 		enodeSet[pos] = struct{}{}
-		resolveInplaceIdenticalBlock(enodeSet, pos, resultIdentBlocks, nil)
+		resolveInplaceIdenticalBlock(enodeSet, pos, resultIdentBlocks)
 	}
 
 	for _, pos := range identBlocks {
-		if pos.Deleted == true {
+		if pos.Deleted {
 			retList = append(retList, (pos.Data).(*xitT))
 		}
 	}
@@ -353,11 +340,10 @@ type HasherRet struct {
 
 func (p *HasherRet) addBlock(fhash uint32, shash *SlowHash) {
 	p.l = append(p.l, &hitT{
-		fastHash: fhash,
+		FastHash: fhash,
 		SlowHash: shash.Hash,
-		tOffset:  shash.TPos.TOffset,
-		tIndex:   uint(shash.TPos.Index),
-		next:     nil,
+		Offset:   shash.TPos.TOffset,
+		Index:    uint(shash.TPos.Index),
 	})
 }
 
@@ -379,17 +365,17 @@ func (p *XdeltaRet) addBlock(data []byte, blkLen uint32, sOffset uint64) {
 	p._addBlock(DT_DIFF, 0, sOffset, blkLen, math.MaxUint32)
 }
 
-func (p *XdeltaRet) _addBlock(t uint16, tPos uint64, sPos uint64, blkLen uint32, tIndex uint32) {
+func (p *XdeltaRet) _addBlock(t uint16, tPos uint64, sPos uint64, blkLen uint32, Index uint32) {
 	p.l = append(p.l, &xitT{
 		Type:    t,
 		SOffset: sPos,
 		TOffset: tPos,
-		Index:   tIndex,
+		Index:   Index,
 		BlkLen:  blkLen,
 	})
 }
 
-func readAndHash(f *os.File, ret *HasherRet, toReadBytes uint64, blkLen int32, tOffset uint64, m hash.Hash) {
+func readAndHash(f *os.File, ret *HasherRet, toReadBytes uint64, blkLen int32, Offset uint64, m hash.Hash) {
 	// Allocate buffer
 	buf := make([]byte, XDELTA_BUFFER_LEN)
 
@@ -421,7 +407,7 @@ func readAndHash(f *os.File, ret *HasherRet, toReadBytes uint64, blkLen int32, t
 			sh := &SlowHash{
 				TPos: TargetPos{
 					Index:   index,
-					TOffset: tOffset,
+					TOffset: Offset,
 				},
 			}
 			copy(sh.Hash[:], md4.New().Sum(buf[i:end]))
@@ -620,23 +606,6 @@ func xdeltaCalcBlockLen(filesize uint64) uint32 {
 	return getXdeltaBlockSize(filesize)
 }
 
-func xdeltaSumBlockSize(filesize uint64) uint32 {
-	blkSize := math.Log2(float64(filesize)) / math.Log2(2)
-	blkSize *= math.Pow(float64(filesize), 1.0/3)
-	iBlkSize := uint32(blkSize)
-
-	if iBlkSize < XDELTA_BLOCK_SIZE {
-		iBlkSize = XDELTA_BLOCK_SIZE
-	} else if iBlkSize > MAX_XDELTA_BLOCK_BYTES {
-		iBlkSize = MAX_XDELTA_BLOCK_BYTES
-	} else {
-		// Adjust block size to align with file size
-		iBlkSize += uint32((iBlkSize % uint32(filesize)) / uint32(filesize/uint64(iBlkSize)))
-	}
-
-	return iBlkSize
-}
-
 func readAndWrite(r *os.File, w *os.File, blklen uint32) error {
 	const BUFSIZE = 4096
 	databuf := make([]byte, BUFSIZE)
@@ -714,11 +683,11 @@ func SingleRound(srcfile, tgtfile string) error {
 
 	hashes := make(map[uint32]*SlowHash)
 	for _, h := range hr.l {
-		hashes[h.fastHash] = &SlowHash{
+		hashes[h.FastHash] = &SlowHash{
 			Hash: h.SlowHash,
 			TPos: TargetPos{
-				TOffset: h.tOffset,
-				Index:   uint32(h.tIndex),
+				TOffset: h.Offset,
+				Index:   uint32(h.Index),
 			},
 		}
 	}
@@ -727,7 +696,6 @@ func SingleRound(srcfile, tgtfile string) error {
 	holeSet[head.Pos] = &Hole{Offset: head.Pos, Length: uint64(ss.Size())}
 
 	// Run  process on source file
-	head.Pos = 0
 	head.Len = uint64(ss.Size())
 	xr := &XdeltaRet{blklen: uint32(blklen)}
 	if head.Len > 0 {
@@ -812,11 +780,11 @@ func MultipleRound(srcfile, tgtfile string) error {
 
 		hashes := make(map[uint32]*SlowHash)
 		for _, h := range hr.l {
-			hashes[h.fastHash] = &SlowHash{
+			hashes[h.FastHash] = &SlowHash{
 				Hash: h.SlowHash,
 				TPos: TargetPos{
-					TOffset: h.tOffset,
-					Index:   uint32(h.tIndex),
+					TOffset: h.Offset,
+					Index:   uint32(h.Index),
 				},
 			}
 		}
@@ -924,11 +892,11 @@ func SingleRoundInplace(srcfile, tgtfile string) error {
 
 	hashes := make(map[uint32]*SlowHash)
 	for _, h := range hr.l {
-		hashes[h.fastHash] = &SlowHash{
+		hashes[h.FastHash] = &SlowHash{
 			Hash: h.SlowHash,
 			TPos: TargetPos{
-				TOffset: h.tOffset,
-				Index:   uint32(h.tIndex),
+				TOffset: h.Offset,
+				Index:   uint32(h.Index),
 			},
 		}
 	}
@@ -937,7 +905,6 @@ func SingleRoundInplace(srcfile, tgtfile string) error {
 	holeSet[head.Pos] = &Hole{Offset: head.Pos, Length: uint64(ss.Size())}
 
 	// Run  process on source file
-	head.Pos = 0
 	head.Len = uint64(ss.Size())
 	xr := &XdeltaRet{blklen: uint32(blklen)}
 	if head.Len > 0 {
